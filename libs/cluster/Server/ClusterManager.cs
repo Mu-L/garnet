@@ -2,8 +2,6 @@
 // Licensed under the MIT license.
 
 using System;
-using System.Collections.Generic;
-using System.Text;
 using System.Threading;
 using Garnet.common;
 using Garnet.server;
@@ -21,12 +19,6 @@ namespace Garnet.cluster
         ClusterConfig currentConfig;
         readonly IDevice clusterConfigDevice;
         readonly SectorAlignedBufferPool pool;
-
-        /// <summary>
-        /// Replication manager - needs to be set after instantiation, hence made public
-        /// </summary>
-        public ReplicationManager replicationManager;
-
         readonly ILogger logger;
 
         /// <summary>
@@ -47,9 +39,7 @@ namespace Garnet.cluster
         /// <summary>
         /// Constructor
         /// </summary>
-        public unsafe ClusterManager(
-            ClusterProvider clusterProvider,
-            ILoggerFactory loggerFactory = null)
+        public unsafe ClusterManager(ClusterProvider clusterProvider, ILogger logger = null)
         {
             this.clusterProvider = clusterProvider;
             var opts = clusterProvider.serverOptions;
@@ -61,7 +51,7 @@ namespace Garnet.cluster
             pool = new(1, (int)clusterConfigDevice.SectorSize);
 
             var address = opts.Address ?? StoreWrapper.GetIp();
-            logger = loggerFactory?.CreateLogger($"ClusterManager-{address}:{opts.Port}");
+            this.logger = logger;
             var recoverConfig = clusterConfigDevice.GetFileSize(0) > 0 && !opts.CleanClusterConfig;
 
             tlsOptions = opts.TlsOptions;
@@ -76,12 +66,12 @@ namespace Garnet.cluster
                 var config = ClusterUtils.ReadDevice(clusterConfigDevice, pool, logger);
                 currentConfig = ClusterConfig.FromByteArray(config);
                 // Used to update endpoint if it change when running inside a container.
-                if (address != currentConfig.GetLocalNodeIp() || opts.Port != currentConfig.GetLocalNodePort())
+                if (address != currentConfig.LocalNodeIp || opts.Port != currentConfig.LocalNodePort)
                 {
                     logger?.LogInformation(
                         "Updating local Endpoint: From {currentConfig.GetLocalNodeIp()}:{currentConfig.GetLocalNodePort()} to {address}:{opts.Port}",
-                        currentConfig.GetLocalNodeIp(),
-                        currentConfig.GetLocalNodePort(),
+                        currentConfig.LocalNodeIp,
+                        currentConfig.LocalNodePort,
                         address,
                         opts.Port);
                 }
@@ -152,14 +142,12 @@ namespace Garnet.cluster
             {
                 var conf = currentConfig;
                 TryInitializeLocalWorker(
-                    conf.GetLocalNodeId(),
+                    conf.LocalNodeId,
                     address,
                     port,
-                    configEpoch: conf.GetLocalNodeConfigEpoch(),
-                    currentConfigEpoch: conf.GetLocalNodeCurrentConfigEpoch(),
-                    lastVotedConfigEpoch: conf.GetLocalNodeLastVotedEpoch(),
-                    role: conf.GetLocalNodeRole(),
-                    replicaOfNodeId: conf.GetLocalNodePrimaryId(),
+                    configEpoch: conf.LocalNodeConfigEpoch,
+                    role: conf.LocalNodeRole,
+                    replicaOfNodeId: conf.LocalNodePrimaryId,
                     hostname: Format.GetHostName());
             }
             else
@@ -169,8 +157,6 @@ namespace Garnet.cluster
                     address,
                     port,
                     configEpoch: 0,
-                    currentConfigEpoch: 0,
-                    lastVotedConfigEpoch: 0,
                     NodeRole.PRIMARY,
                     null,
                     Format.GetHostName());
@@ -189,25 +175,25 @@ namespace Garnet.cluster
                 $"cluster_known_nodes:{current.NumWorkers}\r\n" +
                 $"cluster_size:{current.GetPrimaryCount()}\r\n" +
                 $"cluster_current_epoch:{current.GetMaxConfigEpoch()}\r\n" +
-                $"cluster_my_epoch:{current.GetLocalNodeConfigEpoch()}\r\n" +
+                $"cluster_my_epoch:{current.LocalNodeConfigEpoch}\r\n" +
                 $"cluster_stats_messages_sent:0\r\n" +
                 $"cluster_stats_messages_received:0\r\n";
             return ClusterInfo;
         }
 
-        private static string GetRange(List<int> slots)
+        private static string GetRange(int[] slots)
         {
             var range = "> ";
             var start = slots[0];
             var end = slots[0];
-            for (var i = 1; i < slots.Count + 1; i++)
+            for (var i = 1; i < slots.Length + 1; i++)
             {
-                if (i < slots.Count && slots[i] == end + 1)
+                if (i < slots.Length && slots[i] == end + 1)
                     end = slots[i];
                 else
                 {
                     range += $"{start}-{end} ";
-                    if (i < slots.Count)
+                    if (i < slots.Length)
                     {
                         start = slots[i];
                         end = slots[i];
@@ -218,28 +204,36 @@ namespace Garnet.cluster
         }
 
         /// <summary>
-        /// Update config epoch of local worker
+        /// Attempts to update config epoch of local worker
         /// </summary>
         /// <param name="configEpoch"></param>
+        /// <param name="errorMessage">The ASCII encoded error message if the method returned <see langword="false"/>; otherwise <see langword="default"/></param>
         /// <returns></returns>
-        public ReadOnlySpan<byte> TrySetLocalConfigEpoch(long configEpoch)
+        public bool TrySetLocalConfigEpoch(long configEpoch, out ReadOnlySpan<byte> errorMessage)
         {
+            errorMessage = default;
             while (true)
             {
                 var current = currentConfig;
                 if (current.NumWorkers == 0)
-                    return new ReadOnlySpan<byte>(Encoding.ASCII.GetBytes($"-ERR workers not initialized.\r\n"));
+                {
+                    errorMessage = CmdStrings.RESP_ERR_GENERIC_WORKERS_NOT_INITIALIZED;
+                    return false;
+                }
 
                 var newConfig = currentConfig.SetLocalWorkerConfigEpoch(configEpoch);
                 if (newConfig == null)
-                    return new ReadOnlySpan<byte>(Encoding.ASCII.GetBytes($"-ERR Node config epoch was not set due to invalid epoch specified.\r\n"));
+                {
+                    errorMessage = CmdStrings.RESP_ERR_GENERIC_CONFIG_EPOCH_NOT_SET;
+                    return false;
+                }
 
                 if (Interlocked.CompareExchange(ref currentConfig, newConfig, current) == current)
                     break;
             }
             FlushConfig();
             logger?.LogTrace("SetConfigEpoch {configEpoch}", configEpoch);
-            return CmdStrings.RESP_OK;
+            return true;
         }
 
         /// <summary>
@@ -306,74 +300,22 @@ namespace Garnet.cluster
         }
 
         /// <summary>
-        /// Takeover as new primary but forcefully claiming ownernship of old primary's slots.
+        /// Takeover as new primary but forcefully claim ownership of old primary's slots.
         /// </summary>
-        public void TryTakeOverForPrimary()
-        {
-            while (true)
-            {
-                var current = currentConfig;
-                var newConfig = current.TakeOverFromPrimary();
-                newConfig = newConfig.BumpLocalNodeConfigEpoch();
-                if (Interlocked.CompareExchange(ref currentConfig, newConfig, current) == current)
-                    break;
-            }
-            FlushConfig();
-        }
-
-        private bool slotBitmapGetBit(ref byte[] bitmap, int pos)
-        {
-            int BYTE = (pos / 8);
-            int BIT = pos & 7;
-            return (bitmap[BYTE] & (1 << BIT)) != 0;
-        }
-
-        /// <summary>
-        /// This method is used to process failover requests from replicas of a given primary.
-        /// This node will vote in favor of the request when returning true, or against when returning false.
-        /// </summary>
-        /// <param name="requestingNodeId"></param>
-        /// <param name="requestedEpoch"></param>
-        /// <param name="claimedSlots"></param>
-        /// <returns></returns>
-        public bool AuthorizeFailover(string requestingNodeId, long requestedEpoch, byte[] claimedSlots)
+        public bool TryTakeOverForPrimary()
         {
             while (true)
             {
                 var current = currentConfig;
 
-                //If I am not a primary or I do not have any assigned slots cannot vote
-                var role = current.GetLocalNodeRole();
-                if (role != NodeRole.PRIMARY || current.HasAssignedSlots(1))
+                if (!current.IsReplica || current.LocalNodePrimaryId == null)
                     return false;
 
-                //if I already voted for this epoch return
-                if (current.GetLocalNodeLastVotedEpoch() == requestedEpoch)
-                    return false;
-
-                //Requesting node has to be a known replica node
-                var requestingNodeWorker = current.GetWorkerFromNodeId(requestingNodeId);
-                if (requestingNodeWorker.role == NodeRole.UNASSIGNED)
-                    return false;
-
-                //Check if configEpoch for claimed slots is lower than the config of the requested epoch.
-                for (int i = 0; i < ClusterConfig.MAX_HASH_SLOT_VALUE; i++)
-                {
-                    if (slotBitmapGetBit(ref claimedSlots, i)) continue;
-                    if (current.GetConfigEpochFromSlot(i) < requestedEpoch) continue;
-                    return false;
-                }
-
-                //if reached this point try to update last voted epoch with requested epoch
-                var newConfig = currentConfig.SetLocalNodeLastVotedConfigEpoch(requestedEpoch);
-                //If config has changed in between go back and retry
-                //This can happen when another node trying to acquire that epoch succeeded from the perspective of this node
-                //If that is the case, when we retry to authorize. If lastVotedEpoch has been captured we return no vote
+                var newConfig = current.TakeOverFromPrimary().BumpLocalNodeConfigEpoch();
                 if (Interlocked.CompareExchange(ref currentConfig, newConfig, current) == current)
                     break;
             }
             FlushConfig();
-
             return true;
         }
     }

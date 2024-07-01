@@ -2,7 +2,6 @@
 // Licensed under the MIT license.
 
 using System;
-using System.Text;
 using System.Threading;
 using Garnet.common;
 using Garnet.server;
@@ -25,15 +24,8 @@ namespace Garnet.cluster
                 if (!RespReadUtils.ReadStringWithLengthHeader(out var option, ref ptr, recvBufferPtr + bytesRead))
                     return false;
 
-                FailoverOption failoverOption;
-                try
-                {
-                    failoverOption = (FailoverOption)Enum.Parse(typeof(FailoverOption), option);
-                }
-                catch
-                {
+                if (!Enum.TryParse(option, ignoreCase: true, out FailoverOption failoverOption))
                     failoverOption = FailoverOption.INVALID;
-                }
 
                 args--;
                 if (failoverOption == FailoverOption.INVALID)
@@ -68,10 +60,9 @@ namespace Garnet.cluster
             }
             readHead = (int)(ptr - recvBufferPtr);
 
-            if (clusterProvider.clusterManager.CurrentConfig.GetLocalNodeRole() != NodeRole.PRIMARY)
+            if (clusterProvider.clusterManager.CurrentConfig.LocalNodeRole != NodeRole.PRIMARY)
             {
-                var resp = CmdStrings.RESP_CANNOT_FAILOVER_FROM_NON_MASTER;
-                while (!RespWriteUtils.WriteResponse(resp, ref dcurr, dend))
+                while (!RespWriteUtils.WriteError(CmdStrings.RESP_ERR_GENERIC_CANNOT_FAILOVER_FROM_NON_MASTER, ref dcurr, dend))
                     SendAndReset();
                 return true;
             }
@@ -82,25 +73,22 @@ namespace Garnet.cluster
                 var replicaNodeId = clusterProvider.clusterManager.CurrentConfig.GetWorkerNodeIdFromAddress(replicaAddress, replicaPort);
                 if (replicaNodeId == null)
                 {
-                    var resp = CmdStrings.RESP_UNKNOWN_ENDPOINT_ERROR;
-                    while (!RespWriteUtils.WriteResponse(resp, ref dcurr, dend))
+                    while (!RespWriteUtils.WriteError(CmdStrings.RESP_ERR_GENERIC_UNKNOWN_ENDPOINT, ref dcurr, dend))
                         SendAndReset();
                     return true;
                 }
 
                 var worker = clusterProvider.clusterManager.CurrentConfig.GetWorkerFromNodeId(replicaNodeId);
-                if (worker.role != NodeRole.REPLICA)
+                if (worker.Role != NodeRole.REPLICA)
                 {
-                    var resp = new ReadOnlySpan<byte>(Encoding.ASCII.GetBytes($"-ERR Node @{replicaAddress}:{replicaPort} is not a replica.\r\n"));
-                    while (!RespWriteUtils.WriteResponse(resp, ref dcurr, dend))
+                    while (!RespWriteUtils.WriteError($"ERR Node @{replicaAddress}:{replicaPort} is not a replica.", ref dcurr, dend))
                         SendAndReset();
                     return true;
                 }
 
-                if (worker.replicaOfNodeId != clusterProvider.clusterManager.CurrentConfig.GetLocalNodeId())
+                if (worker.ReplicaOfNodeId != clusterProvider.clusterManager.CurrentConfig.LocalNodeId)
                 {
-                    var resp = new ReadOnlySpan<byte>(Encoding.ASCII.GetBytes($"-ERR Node @{replicaAddress}:{replicaPort} is not my replica.\r\n"));
-                    while (!RespWriteUtils.WriteResponse(resp, ref dcurr, dend))
+                    while (!RespWriteUtils.WriteError($"ERR Node @{replicaAddress}:{replicaPort} is not my replica.", ref dcurr, dend))
                         SendAndReset();
                     return true;
                 }
@@ -118,7 +106,7 @@ namespace Garnet.cluster
                 _ = clusterProvider.failoverManager.TryStartPrimaryFailover(replicaAddress, replicaPort, force ? FailoverOption.FORCE : FailoverOption.DEFAULT, timeoutTimeSpan);
             }
 
-            while (!RespWriteUtils.WriteResponse(CmdStrings.RESP_OK, ref dcurr, dend))
+            while (!RespWriteUtils.WriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
                 SendAndReset();
             return true;
         }

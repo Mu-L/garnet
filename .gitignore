@@ -165,6 +165,8 @@ ClientBin/
 *.publishsettings
 node_modules/
 **/log-commits
+.mono
+**/package-lock.json
 
 # RIA/Silverlight projects
 Generated_Code/

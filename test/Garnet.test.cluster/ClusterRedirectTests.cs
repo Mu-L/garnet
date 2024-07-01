@@ -4,6 +4,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Garnet.common;
 using Microsoft.Extensions.Logging;
 using NUnit.Framework;
 using NUnit.Framework.Internal;
@@ -172,7 +173,7 @@ ClusterRedirectTests.TestFlags testFlags)
 
             //6. EXISTS
             new ("EXISTS", ["SET <key#0> <s#0>"], "EXISTS <key#0>", ["DEL <key#0>"], "1", null, (TestFlags.READONLY | TestFlags.SINGLEKEY | TestFlags.KEY_EXISTS)),
-            new ("EXISTS", ["SET <key#0> <s#0>"], "EXISTS <key#0>", ["DEL <key#0>"], "1", null, (TestFlags.READONLY | TestFlags.SINGLEKEY | TestFlags.KEY_EXISTS | TestFlags.ASKING)),            
+            new ("EXISTS", ["SET <key#0> <s#0>"], "EXISTS <key#0>", ["DEL <key#0>"], "1", null, (TestFlags.READONLY | TestFlags.SINGLEKEY | TestFlags.KEY_EXISTS | TestFlags.ASKING)),
 
             //7. INCR
             new ("INCR", ["SET <key#0> 100"], "INCR <key#0>", ["DEL <key#0>"], "101", null, (TestFlags.SINGLEKEY | TestFlags.READ_WRITE)),
@@ -443,6 +444,10 @@ ClusterRedirectTests.TestFlags testFlags)
             //2. MGET
             new ("MGET", ["MSET <key#0> <s#0> <key#1> <s#1> <key#2> <s#2>"],"MGET <key#0> <key#1> <key#2>", ["DEL <key#0>", "DEL <key#1>", "DEL <key#2>"], null, ["<s#0>", "<s#1>", "<s#2>"], (TestFlags.READONLY | TestFlags.MULTIKEY | TestFlags.KEY_EXISTS)),
             new ("MGET", ["MSET <key#0> <s#0> <key#1> <s#1> <key#2> <s#2>"],"MGET <key#0> <key#1> <key#2>", ["DEL <key#0>", "DEL <key#1>", "DEL <key#2>"], null, ["<s#0>", "<s#1>", "<s#2>"], (TestFlags.READONLY | TestFlags.MULTIKEY | TestFlags.KEY_EXISTS | TestFlags.ASKING)),
+
+            //3. EXISTS
+            new ("EXISTS", ["MSET <key#0> <s#0> <key#1> <s#1> <key#2> <s#2>"],"EXISTS <key#0> <key#1> <key#2>", ["DEL <key#0>", "DEL <key#1>", "DEL <key#2>"], "3", ["<s#0>", "<s#1>", "<s#2>"], (TestFlags.READONLY | TestFlags.MULTIKEY | TestFlags.KEY_EXISTS)),
+            new ("EXISTS", ["MSET <key#0> <s#0> <key#1> <s#1> <key#2> <s#2>"],"EXISTS <key#0> <key#1> <key#2>", ["DEL <key#0>", "DEL <key#1>", "DEL <key#2>"], "3", ["<s#0>", "<s#1>", "<s#2>"], (TestFlags.READONLY | TestFlags.MULTIKEY | TestFlags.KEY_EXISTS | TestFlags.ASKING)),
             #endregion
 
             #region hllCommands
@@ -473,7 +478,7 @@ ClusterRedirectTests.TestFlags testFlags)
             #endregion
         };
 
-        private (ResponseState, string, string[]) SendToNodeFromSlot(ref LightClientRequest[] connections, string cmd, int slot, string cmdTag, bool checkAssert = true)
+        private static (ResponseState, string, string[]) SendToNodeFromSlot(ref LightClientRequest[] connections, string cmd, int slot, string cmdTag, bool checkAssert = true)
         {
             var nodeIndex = ClusterTestUtils.GetSourceNodeIndexFromSlot(ref connections, (ushort)slot);
             var result = connections[nodeIndex].SendCommand(cmd);
@@ -498,7 +503,7 @@ ClusterRedirectTests.TestFlags testFlags)
 
             var result = connections[otherNodeIndex].SendCommand(cmd);
             var status = ClusterTestUtils.ParseResponseState(result, out var _slot, out var _address, out var _port, out var _value, out var _values);
-            Assert.AreEqual(status, ResponseState.MOVED);
+            Assert.AreEqual(status, ResponseState.MOVED, cmd);
             Assert.AreEqual(_slot, slot);
             Assert.AreEqual(_address, connections[nodeIndex].Address);
             Assert.AreEqual(_port, connections[nodeIndex].Port);
@@ -603,13 +608,13 @@ ClusterRedirectTests.TestFlags testFlags)
             var respMigratingStable = ClusterTestUtils.SetSlot(ref connections[sourceNodeIndex], migrateSlot, "STABLE", "");
             Assert.AreEqual(respMigratingStable, "OK");
 
-            if (CheckFlag(command.testFlags, (TestFlags.KEY_EXISTS | TestFlags.READONLY)))
+            if (CheckFlag(command.testFlags, TestFlags.KEY_EXISTS | TestFlags.READONLY))
             {
                 Assert.AreEqual(status, ResponseState.OK, command.cmdTag);
             }
             else if (CheckFlag(command.testFlags, (TestFlags.KEY_EXISTS)))
             {
-                Assert.AreEqual(status, ResponseState.MIGRATING, command.cmdTag);
+                Assert.AreEqual(status, ResponseState.OK, command.cmdTag);
             }
             else
             {
@@ -660,7 +665,7 @@ ClusterRedirectTests.TestFlags testFlags)
                     Assert.AreEqual(status, ResponseState.OK, command.cmdTag);
                     if (command.response != null)
                     {
-                        Assert.AreEqual(value, response, command.cmdTag);
+                        Assert.AreEqual(value, response, command.testCmd);
                     }
                     else if (command.arrayResponse != null)
                     {
@@ -753,7 +758,7 @@ ClusterRedirectTests.TestFlags testFlags)
                 if (testCmd != null)
                 {
                     var (status, value, values) = SendToNodeFromSlot(ref connections, testCmd, slots.Last(), command.cmdTag, false);
-                    Assert.AreEqual(ResponseState.CROSSSLOT, status);
+                    Assert.AreEqual(ResponseState.CROSSSLOT, status, testCmd);
                 }
             }
 
